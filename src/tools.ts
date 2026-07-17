@@ -5,16 +5,6 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 async function generateQRContent(qrString: string): Promise<string> {
   try {
-    const url = `https://quickchart.io/qr?text=${encodeURIComponent(qrString)}&size=300&margin=2&format=png`;
-    const res = await fetch(url, { method: "GET", signal: AbortSignal.timeout(8000) });
-    if (res.ok) {
-      return `Scan this QR code with your WhatsApp mobile app (Settings → Linked Devices → Link a Device):\n\n![QR Code](${url})\n\nIf the image doesn't appear, open this URL directly: ${url}`;
-    }
-  } catch (e) {
-    console.error("QuickChart QR failed:", (e as Error).message);
-  }
-
-  try {
     const dataUri = await QRCode.toDataURL(qrString, { width: 250, margin: 1, errorCorrectionLevel: "L" });
     return `Scan this QR code with your WhatsApp mobile app (Settings → Linked Devices → Link a Device):\n\n![QR Code](${dataUri})`;
   } catch (e) {

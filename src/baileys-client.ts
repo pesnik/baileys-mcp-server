@@ -204,13 +204,7 @@ export class BaileysClient extends EventEmitter {
   async getQR(): Promise<string> {
     if (this._connected) throw new Error("Already connected.");
     if (!this.qrPromise) this.createQRPromise();
-    const result = await Promise.race([
-      this.qrPromise!,
-      new Promise<string>((_, reject) =>
-        setTimeout(() => reject(new Error("QR code not ready yet — WhatsApp is still connecting. Try again in 5-10 seconds.")), 15000)
-      ),
-    ]);
-    return result;
+    return this.qrPromise!;
   }
 
   async getConnectionStatus(): Promise<ConnectionData> {

@@ -20,7 +20,7 @@ export function registerTools(server: McpServer, client: BaileysClient): void {
     "wa_get_qr",
     {
       title: "Get WhatsApp QR Code",
-      description: `Get a QR code for pairing WhatsApp Web. Returns a QR code image URL. IMPORTANT: You MUST display the full URL or image to the user verbatim — do NOT summarize or paraphrase the result. The user needs to scan the QR code with their phone. Only needed when not yet authenticated.`,
+      description: `Generate a QR code for pairing WhatsApp Web. This may take 10-30 seconds while WhatsApp establishes the connection. Returns a QR code image. IMPORTANT: Display the image to the user — do NOT summarize. The user needs to scan it with WhatsApp mobile (Settings → Linked Devices → Link a Device). Only needed when not authenticated.`,
       inputSchema: z.object({}).strict(),
       annotations: {
         readOnlyHint: true,

@@ -4,4 +4,6 @@ dist/
 auth_info/
 wa-auth/
 .wa-mcp-auth/
+wa-data/
+.wa-mcp-data/
 .env

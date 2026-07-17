@@ -1,10 +1,11 @@
 {
-  "mcpServers": {
+  "mcp": {
     "baileys": {
-      "command": "node",
-      "args": ["/Users/mr.hasan/MCP/baileys-mcp-server/dist/index.js"],
-      "env": {
-        "WA_AUTH_DIR": "/Users/mr.hasan/.wa-mcp-auth"
+      "type": "local",
+      "command": ["node", "--experimental-sqlite", "/Users/mr.hasan/MCP/baileys-mcp-server/dist/index.js"],
+      "environment": {
+        "WA_AUTH_DIR": "/Users/mr.hasan/.wa-mcp-auth",
+        "WA_DATA_DIR": "/Users/mr.hasan/.wa-mcp-data"
       }
     }
   }

@@ -6,7 +6,8 @@ import { BaileysClient } from "./baileys-client.js";
 import { registerTools } from "./tools.js";
 
 const AUTH_DIR = process.env.WA_AUTH_DIR || "./wa-auth";
-const client = new BaileysClient(AUTH_DIR);
+const DATA_DIR = process.env.WA_DATA_DIR || "./wa-data";
+const client = new BaileysClient(AUTH_DIR, DATA_DIR);
 
 client.on("connected", (data) => {
   console.error(`WhatsApp connected: ${(data as any).phone}`);

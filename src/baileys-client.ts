@@ -1,7 +1,11 @@
 import {
   makeWASocket,
   useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
   DisconnectReason,
+  isJidGroup,
+  jidNormalizedUser,
   type WAMessage,
   type WASocket,
   type Chat,
@@ -10,40 +14,36 @@ import { Boom } from "@hapi/boom";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { EventEmitter } from "node:events";
+import pino from "pino";
+import * as db from "./database.js";
 import type { ConnectionData } from "./types.js";
-
-interface StoredChat {
-  jid: string;
-  name: string;
-  unreadCount: number;
-}
-
-interface StoredMessage {
-  id: string;
-  text: string;
-  fromMe: boolean;
-  sender?: string;
-  timestamp: number;
-  type: string;
-  chatJid: string;
-}
 
 export class BaileysClient extends EventEmitter {
   private sock: WASocket | null = null;
   private authDir: string;
+  private dataDir: string;
   private startTime: number = 0;
-  private connected: boolean = false;
   private qrResolve: ((qr: string) => void) | null = null;
   private qrPromise: Promise<string> | null = null;
-  private chats: Map<string, StoredChat> = new Map();
-  private messages: Map<string, StoredMessage[]> = new Map();
+  private logger: pino.Logger;
+  private _connected: boolean = false;
 
-  constructor(authDir: string) {
+  constructor(authDir: string, dataDir: string) {
     super();
     this.authDir = path.resolve(authDir);
+    this.dataDir = path.resolve(dataDir);
     if (!fs.existsSync(this.authDir)) {
       fs.mkdirSync(this.authDir, { recursive: true });
     }
+    db.initDatabase(this.dataDir);
+    this.logger = pino(
+      { level: "info", timestamp: pino.stdTimeFunctions.isoTime },
+      pino.destination(path.join(this.dataDir, "wa-logs.txt")),
+    );
+  }
+
+  isConnected(): boolean {
+    return this._connected;
   }
 
   private createQRPromise(): Promise<string> {
@@ -53,146 +53,162 @@ export class BaileysClient extends EventEmitter {
     return this.qrPromise;
   }
 
-  private extractText(msg: WAMessage): string {
+  private parseMessage(msg: WAMessage): Omit<db.Message, "chat_name"> | null {
+    if (!msg.message || !msg.key || !msg.key.remoteJid) return null;
+    let content: string | null = null;
     const m = msg.message;
-    if (!m) return "[empty message]";
-    return (
-      m.conversation ||
-      m.extendedTextMessage?.text ||
-      m.imageMessage?.caption ||
-      m.videoMessage?.caption ||
-      m.documentMessage?.caption ||
-      "[non-text message]"
-    );
-  }
-
-  private upsertChat(id: string | null | undefined, name?: string | null, unreadCount?: number | null): void {
-    if (!id) return;
-    const existing = this.chats.get(id);
-    this.chats.set(id, {
-      jid: id,
-      name: name || existing?.name || id.split("@")[0],
-      unreadCount: unreadCount ?? existing?.unreadCount ?? 0,
-    });
-  }
-
-  private upsertMessage(msg: WAMessage): void {
-    const jid = msg.key?.remoteJid;
-    if (!jid) return;
-    if (!this.messages.has(jid)) {
-      this.messages.set(jid, []);
-    }
-    const msgs = this.messages.get(jid)!;
-    const idx = msgs.findIndex((m) => m.id === msg.key?.id);
-    const entry: StoredMessage = {
-      id: msg.key?.id || "",
-      text: this.extractText(msg),
-      fromMe: msg.key?.fromMe ?? false,
-      sender: msg.key?.participant || msg.key?.remoteJid || undefined,
-      timestamp:
-        typeof msg.messageTimestamp === "number"
-          ? msg.messageTimestamp
-          : Date.now(),
-      type: Object.keys(msg.message || {})[0] || "unknown",
-      chatJid: jid,
+    if (m.conversation) content = m.conversation;
+    else if (m.extendedTextMessage?.text) content = m.extendedTextMessage.text;
+    else if (m.imageMessage?.caption) content = `[Image] ${m.imageMessage.caption}`;
+    else if (m.videoMessage?.caption) content = `[Video] ${m.videoMessage.caption}`;
+    else if (m.documentMessage?.caption) content = `[Document] ${m.documentMessage.caption || m.documentMessage.fileName || ""}`;
+    else if (m.audioMessage) content = "[Audio]";
+    else if (m.stickerMessage) content = "[Sticker]";
+    else if (m.contactMessage?.displayName) content = `[Contact] ${m.contactMessage.displayName}`;
+    else if (m.pollCreationMessage?.name) content = `[Poll] ${m.pollCreationMessage.name}`;
+    if (!content) return null;
+    let ts = Date.now();
+    if (msg.messageTimestamp != null) ts = Number(msg.messageTimestamp) * 1000;
+    let sender: string | null | undefined = msg.key.participant;
+    if (!msg.key.fromMe && !sender && !isJidGroup(msg.key.remoteJid)) sender = msg.key.remoteJid;
+    if (msg.key.fromMe && !isJidGroup(msg.key.remoteJid)) sender = null;
+    return {
+      id: msg.key.id!,
+      chat_jid: msg.key.remoteJid,
+      sender: sender ? jidNormalizedUser(sender) : null,
+      content,
+      timestamp: new Date(ts).toISOString(),
+      is_from_me: msg.key.fromMe ?? false,
     };
-    if (idx >= 0) {
-      msgs[idx] = entry;
-    } else {
-      msgs.push(entry);
-    }
-    msgs.sort((a, b) => b.timestamp - a.timestamp);
   }
 
   async connect(): Promise<void> {
-    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
-    this.startTime = Date.now();
+    if (this.sock) {
+      try { await this.sock.end(undefined); } catch {}
+      this.sock = null;
+    }
+    this._connected = false;
 
+    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    this.logger.info({ version, isLatest }, "Baileys version");
+
+    this.startTime = Date.now();
     this.sock = makeWASocket({
-      auth: state,
-      syncFullHistory: false,
-      emitOwnEvents: false,
+      version,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, this.logger),
+      },
+      syncFullHistory: true,
+      logger: this.logger,
       generateHighQualityLinkPreview: true,
-      qrTimeout: 120_000,
+      markOnlineOnConnect: false,
     });
 
-    this.sock.ev.on("creds.update", saveCreds);
     this.createQRPromise();
 
-    this.sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr && this.qrResolve) {
-        this.qrResolve(qr);
-        this.qrResolve = null;
-      }
-
-      if (connection === "close") {
-        const shouldReconnect =
-          (lastDisconnect?.error as Boom)?.output?.statusCode !==
-          DisconnectReason.loggedOut;
-
-        this.connected = false;
-        this.emit("disconnected");
-
-        if (shouldReconnect) {
-          console.error("Connection closed, reconnecting...");
-          await this.connect();
-        } else {
-          console.error("Logged out, delete auth dir to re-pair");
+    this.sock.ev.process(async (events) => {
+      if (events["connection.update"]) {
+        const { connection, lastDisconnect, qr } = events["connection.update"];
+        if (qr && this.qrResolve) {
+          this.qrResolve(qr);
+          this.qrResolve = null;
         }
-      } else if (connection === "open") {
-        this.connected = true;
-        const user = this.sock?.user;
-        this.emit("connected", {
-          jid: user?.id,
-          phone: user?.id ? user.id.split("@")[0] : undefined,
-        });
-      }
-    });
-
-    this.sock.ev.on("messaging-history.set", ({ chats, messages }) => {
-      for (const chat of chats) {
-        this.upsertChat(chat.id, chat.name, chat.unreadCount);
-      }
-      for (const msg of messages) {
-        this.upsertMessage(msg);
-      }
-    });
-
-    this.sock.ev.on("chats.upsert", (chats) => {
-      for (const chat of chats) {
-        this.upsertChat(chat.id, chat.name, chat.unreadCount);
-      }
-    });
-
-    this.sock.ev.on("chats.update", (updates) => {
-      for (const update of updates) {
-        if (update.id) {
-          this.upsertChat(update.id, "name" in update ? update.name : undefined, "unreadCount" in update ? update.unreadCount : undefined);
+        if (connection === "close") {
+          const code = (lastDisconnect?.error as Boom)?.output?.statusCode;
+          const shouldReconnect = code !== DisconnectReason.loggedOut;
+          this._connected = false;
+          this.emit("disconnected");
+          this.logger.warn({ code }, "connection closed");
+          if (shouldReconnect) {
+            setTimeout(() => this.connect(), 3000);
+          } else {
+            this.logger.error("logged out");
+          }
+        } else if (connection === "open") {
+          this._connected = true;
+          this.logger.info({ jid: this.sock?.user?.id }, "connected");
+          this.emit("connected", {
+            jid: this.sock?.user?.id,
+            phone: this.sock?.user?.id?.split("@")[0],
+          });
         }
       }
-    });
 
-    this.sock.ev.on("messages.upsert", ({ messages }) => {
-      for (const msg of messages) {
-        this.upsertMessage(msg);
+      if (events["creds.update"]) {
+        await saveCreds();
+      }
+
+      if (events["messaging-history.set"]) {
+        const { chats, contacts, messages } = events["messaging-history.set"];
+        this.logger.info({ chats: chats.length, contacts: contacts.length, messages: messages.length }, "history sync");
+        for (const c of contacts) {
+          db.storeContact(this.dataDir, {
+            jid: c.id,
+            name: c.name ?? null,
+            notify: c.notify ?? null,
+            phone_number: (c as any).phoneNumber ?? null,
+          });
+        }
+        for (const chat of chats) {
+          const name = chat.name || chat.id?.split("@")[0] || null;
+          db.storeChat(this.dataDir, {
+            jid: chat.id!,
+            name,
+            last_message_time: chat.conversationTimestamp
+              ? new Date(Number(chat.conversationTimestamp) * 1000).toISOString()
+              : null,
+          });
+        }
+        for (const msg of messages) {
+          const parsed = this.parseMessage(msg);
+          if (parsed) db.storeMessage(this.dataDir, parsed);
+        }
+      }
+
+      if (events["messages.upsert"]) {
+        const { messages } = events["messages.upsert"];
+        for (const msg of messages) {
+          const parsed = this.parseMessage(msg);
+          if (parsed) db.storeMessage(this.dataDir, parsed);
+        }
+      }
+
+      if (events["chats.upsert"]) {
+        for (const chat of events["chats.upsert"]) {
+          db.storeChat(this.dataDir, {
+            jid: chat.id!,
+            name: chat.name,
+            last_message_time: chat.conversationTimestamp
+              ? new Date(Number(chat.conversationTimestamp) * 1000).toISOString()
+              : null,
+          });
+        }
+      }
+
+      if (events["chats.update"]) {
+        for (const update of events["chats.update"]) {
+          db.storeChat(this.dataDir, {
+            jid: update.id!,
+            name: update.name,
+            last_message_time: update.conversationTimestamp
+              ? new Date(Number(update.conversationTimestamp) * 1000).toISOString()
+              : null,
+          });
+        }
       }
     });
   }
 
   async getQR(): Promise<string> {
-    if (this.connected) {
-      throw new Error("Already connected. No QR needed.");
-    }
-    if (!this.qrPromise) {
-      return this.createQRPromise();
-    }
+    if (this._connected) throw new Error("Already connected.");
+    if (!this.qrPromise) return this.createQRPromise();
     return this.qrPromise;
   }
 
   async getConnectionStatus(): Promise<ConnectionData> {
-    if (!this.sock || !this.connected) {
+    if (!this.sock || !this._connected) {
       return { connected: false };
     }
     return {
@@ -204,44 +220,35 @@ export class BaileysClient extends EventEmitter {
   }
 
   async sendMessage(jid: string, text: string): Promise<string> {
-    if (!this.sock || !this.connected) {
-      throw new Error("Not connected to WhatsApp");
-    }
+    if (!this.sock) throw new Error("Not connected to WhatsApp");
     const result = await this.sock.sendMessage(jid, { text });
     return result?.key?.id || "unknown";
   }
 
   async sendImage(jid: string, url: string, caption?: string): Promise<string> {
-    if (!this.sock || !this.connected) {
-      throw new Error("Not connected to WhatsApp");
-    }
-    const result = await this.sock.sendMessage(jid, {
-      image: { url },
-      caption,
-    });
+    if (!this.sock) throw new Error("Not connected to WhatsApp");
+    const result = await this.sock.sendMessage(jid, { image: { url }, caption });
     return result?.key?.id || "unknown";
   }
 
-  listChats(): StoredChat[] {
-    return Array.from(this.chats.values());
+  listChats(limit: number = 30, offset: number = 0, query?: string | null): db.Chat[] {
+    return db.getChats(this.dataDir, limit, offset, query);
   }
 
-  listMessages(jid: string, limit: number = 50): StoredMessage[] {
-    const msgs = this.messages.get(jid) || [];
-    return msgs.slice(0, limit);
+  listMessages(jid: string, limit: number = 50, offset: number = 0): db.Message[] {
+    return db.getMessages(this.dataDir, jid, limit, offset);
   }
 
-  searchContacts(query: string): StoredChat[] {
-    const q = query.toLowerCase();
-    return Array.from(this.chats.values())
-      .filter((c) => c.name.toLowerCase().includes(q) || c.jid.toLowerCase().includes(q))
-      .slice(0, 20);
+  searchContacts(query: string): { jid: string; name: string | null }[] {
+    return db.searchContacts(this.dataDir, query);
   }
 
-  listGroups(): StoredChat[] {
-    return Array.from(this.chats.values()).filter((c) =>
-      c.jid.endsWith("@g.us"),
-    );
+  listGroups(): db.Chat[] {
+    return db.getChats(this.dataDir, 100, 0).filter((c) => c.jid.endsWith("@g.us"));
+  }
+
+  getTotalChats(): number {
+    return db.getTotalChats(this.dataDir);
   }
 
   async disconnect(): Promise<void> {
@@ -249,12 +256,6 @@ export class BaileysClient extends EventEmitter {
       await this.sock.end(undefined);
       this.sock = null;
     }
-    this.connected = false;
-    this.chats.clear();
-    this.messages.clear();
-  }
-
-  isConnected(): boolean {
-    return this.connected;
+    this._connected = false;
   }
 }

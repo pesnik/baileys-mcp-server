@@ -1,0 +1,12 @@
+{
+  "mcp": {
+    "baileys": {
+      "type": "local",
+      "command": ["node", "--experimental-sqlite", "dist/index.js"],
+      "environment": {
+        "WA_AUTH_DIR": "./wa-auth",
+        "WA_DATA_DIR": "./wa-data"
+      }
+    }
+  }
+}
